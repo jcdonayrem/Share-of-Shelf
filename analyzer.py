@@ -21,6 +21,19 @@ def load_image(uploaded_file) -> np.ndarray:
     return cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
 
 
+def preprocess_image(img_bgr: np.ndarray) -> np.ndarray:
+    """
+    Applies CLAHE (Contrast Limited Adaptive Histogram Equalization)
+    to improve contrast and mitigate lighting variations.
+    """
+    lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB)
+    l_channel, a, b = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    cl = clahe.apply(l_channel)
+    limg = cv2.merge((cl, a, b))
+    return cv2.cvtColor(limg, cv2.COLOR_LAB2BGR)
+
+
 # ─────────────────────────────────────────────
 # 2. SHELF LEVEL DETECTION
 # ─────────────────────────────────────────────
@@ -70,14 +83,20 @@ def detect_shelf_levels(img_bgr: np.ndarray, n_levels: int) -> list:
 # ─────────────────────────────────────────────
 
 def extract_dominant_colors(img_bgr: np.ndarray, n_colors: int = 1) -> np.ndarray:
-    """Returns the n dominant colors (RGB) in a region using K-Means."""
-    data = img_bgr.reshape(-1, 3).astype(np.float32)
+    """
+    Returns the n dominant colors (RGB) in a region using K-Means
+    in the LAB color space for better perceptual uniformity.
+    """
+    img_lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB)
+    data = img_lab.reshape(-1, 3).astype(np.float32)
 
-    brightness = data.mean(axis=1)
-    mask = (brightness > 30) & (brightness < 225)
+    # Filter by L channel (brightness in LAB)
+    l_channel = data[:, 0]
+    mask = (l_channel > 25) & (l_channel < 230)
     filtered = data[mask]
 
     if len(filtered) < n_colors * 10:
+        # Fallback to gray in LAB -> then to RGB
         return np.array([[128, 128, 128]])
 
     k = min(n_colors, len(filtered))
@@ -86,9 +105,13 @@ def extract_dominant_colors(img_bgr: np.ndarray, n_colors: int = 1) -> np.ndarra
 
     counts = np.bincount(km.labels_)
     order = np.argsort(counts)[::-1]
-    centers = km.cluster_centers_[order]
+    centers_lab = km.cluster_centers_[order]
 
-    return centers[:, ::-1].astype(int)  # BGR → RGB
+    # Convert LAB centers back to RGB
+    centers_lab_reshaped = centers_lab.reshape(-1, 1, 3).astype(np.uint8)
+    centers_rgb = cv2.cvtColor(centers_lab_reshaped, cv2.COLOR_LAB2RGB).reshape(-1, 3)
+
+    return centers_rgb.astype(int)
 
 
 # ─────────────────────────────────────────────
@@ -119,11 +142,13 @@ def cluster_brands(
             row_colors.append(dominant[0])
         cell_colors.append(row_colors)
 
-    all_colors = np.array([c for row in cell_colors for c in row], dtype=np.float32)
+    # Convert cell_colors (RGB) to LAB for global clustering
+    all_colors_rgb = np.array([c for row in cell_colors for c in row], dtype=np.uint8)
+    all_colors_lab = cv2.cvtColor(all_colors_rgb.reshape(-1, 1, 3), cv2.COLOR_RGB2LAB).reshape(-1, 3).astype(np.float32)
 
-    n_clusters = min(n_brands, len(all_colors))
+    n_clusters = min(n_brands, len(all_colors_lab))
     km = KMeans(n_clusters=n_clusters, n_init=10, random_state=42)
-    labels = km.fit_predict(all_colors)
+    labels = km.fit_predict(all_colors_lab)
 
     brand_grid = []
     idx = 0
@@ -136,7 +161,8 @@ def cluster_brands(
 
     brand_colors = {}
     for bid in range(n_clusters):
-        center_rgb = km.cluster_centers_[bid][::-1]
+        center_lab = km.cluster_centers_[bid]
+        center_rgb = cv2.cvtColor(center_lab.reshape(1, 1, 3).astype(np.uint8), cv2.COLOR_LAB2RGB).reshape(3)
         brand_colors[bid] = tuple(center_rgb.astype(int))
 
     brand_names = {bid: f"Marca {bid + 1}" for bid in range(n_clusters)}

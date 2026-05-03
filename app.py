@@ -10,6 +10,7 @@ from PIL import Image
 
 from analyzer import (
     load_image,
+    preprocess_image,
     detect_shelf_levels,
     cluster_brands,
     compute_share_of_shelf,
@@ -256,7 +257,8 @@ elif analyze_btn or st.session_state.get("analyzed"):
     if analyze_btn:
         with st.spinner("Analizando imagen..."):
             try:
-                img_bgr = load_image(uploaded)
+                img_bgr_raw = load_image(uploaded)
+                img_bgr = preprocess_image(img_bgr_raw)
 
                 if use_edge_detection:
                     levels = detect_shelf_levels(img_bgr, n_levels)
