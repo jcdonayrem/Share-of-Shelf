@@ -8,8 +8,10 @@ import numpy as np
 import pandas as pd
 from PIL import Image
 
+import easyocr
 from analyzer import (
     load_image,
+    preprocess_image,
     detect_shelf_levels,
     cluster_brands,
     compute_share_of_shelf,
@@ -21,6 +23,14 @@ from charts import (
     make_level_stacked_bar,
     make_brand_color_legend,
 )
+
+# ─────────────────────────────────────────────
+# OCR READER CACHE
+# ─────────────────────────────────────────────
+
+@st.cache_resource
+def get_ocr_reader():
+    return easyocr.Reader(['es', 'en'], gpu=False)
 
 # ─────────────────────────────────────────────
 # PAGE CONFIG
@@ -256,7 +266,8 @@ elif analyze_btn or st.session_state.get("analyzed"):
     if analyze_btn:
         with st.spinner("Analizando imagen..."):
             try:
-                img_bgr = load_image(uploaded)
+                img_bgr_raw = load_image(uploaded)
+                img_bgr = preprocess_image(img_bgr_raw)
 
                 if use_edge_detection:
                     levels = detect_shelf_levels(img_bgr, n_levels)
@@ -265,8 +276,9 @@ elif analyze_btn or st.session_state.get("analyzed"):
                     step = h // n_levels
                     levels = [(i * step, (i + 1) * step) for i in range(n_levels)]
 
+                ocr_reader = get_ocr_reader()
                 cluster_result = cluster_brands(
-                    img_bgr, levels, n_cols, n_brands
+                    img_bgr, levels, n_cols, n_brands, ocr_reader=ocr_reader
                 )
 
                 sos_result = compute_share_of_shelf(
@@ -325,7 +337,7 @@ elif analyze_btn or st.session_state.get("analyzed"):
                 unsafe_allow_html=True,
             )
             new_name = st.text_input(
-                f"Marca {bid + 1}",
+                f"Sugerencia: {brand_names[bid]}",
                 value=brand_names[bid],
                 key=f"brand_name_{bid}",
                 label_visibility="collapsed",

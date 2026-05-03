@@ -9,6 +9,7 @@ import cv2
 from collections import Counter
 from sklearn.cluster import KMeans
 from PIL import Image
+import easyocr
 
 
 # ─────────────────────────────────────────────
@@ -19,6 +20,19 @@ def load_image(uploaded_file) -> np.ndarray:
     """Convert Streamlit UploadedFile → OpenCV BGR array."""
     img = Image.open(uploaded_file).convert("RGB")
     return cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+
+
+def preprocess_image(img_bgr: np.ndarray) -> np.ndarray:
+    """
+    Applies CLAHE (Contrast Limited Adaptive Histogram Equalization)
+    to improve contrast and mitigate lighting variations.
+    """
+    lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB)
+    l_channel, a, b = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    cl = clahe.apply(l_channel)
+    limg = cv2.merge((cl, a, b))
+    return cv2.cvtColor(limg, cv2.COLOR_LAB2BGR)
 
 
 # ─────────────────────────────────────────────
@@ -70,14 +84,20 @@ def detect_shelf_levels(img_bgr: np.ndarray, n_levels: int) -> list:
 # ─────────────────────────────────────────────
 
 def extract_dominant_colors(img_bgr: np.ndarray, n_colors: int = 1) -> np.ndarray:
-    """Returns the n dominant colors (RGB) in a region using K-Means."""
-    data = img_bgr.reshape(-1, 3).astype(np.float32)
+    """
+    Returns the n dominant colors (RGB) in a region using K-Means
+    in the LAB color space for better perceptual uniformity.
+    """
+    img_lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB)
+    data = img_lab.reshape(-1, 3).astype(np.float32)
 
-    brightness = data.mean(axis=1)
-    mask = (brightness > 30) & (brightness < 225)
+    # Filter by L channel (brightness in LAB)
+    l_channel = data[:, 0]
+    mask = (l_channel > 25) & (l_channel < 230)
     filtered = data[mask]
 
     if len(filtered) < n_colors * 10:
+        # Fallback to gray in LAB -> then to RGB
         return np.array([[128, 128, 128]])
 
     k = min(n_colors, len(filtered))
@@ -86,13 +106,67 @@ def extract_dominant_colors(img_bgr: np.ndarray, n_colors: int = 1) -> np.ndarra
 
     counts = np.bincount(km.labels_)
     order = np.argsort(counts)[::-1]
-    centers = km.cluster_centers_[order]
+    centers_lab = km.cluster_centers_[order]
 
-    return centers[:, ::-1].astype(int)  # BGR → RGB
+    # Convert LAB centers back to RGB
+    centers_lab_reshaped = centers_lab.reshape(-1, 1, 3).astype(np.uint8)
+    centers_rgb = cv2.cvtColor(centers_lab_reshaped, cv2.COLOR_LAB2RGB).reshape(-1, 3)
+
+    return centers_rgb.astype(int)
 
 
 # ─────────────────────────────────────────────
-# 4. BRAND CLUSTERING ACROSS THE SHELF
+# 4. BRAND TEXT RECOGNITION
+# ─────────────────────────────────────────────
+
+def detect_brand_names(img_bgr: np.ndarray, levels: list, brand_grid: list, n_clusters: int, reader=None) -> dict:
+    """
+    Attempts to recognize brand names using EasyOCR.
+    Aggregates text found in cells belonging to the same cluster.
+    """
+    if reader is None:
+        reader = easyocr.Reader(['es', 'en'], gpu=False)
+    brand_texts = {bid: [] for bid in range(n_clusters)}
+
+    h, w = img_bgr.shape[:2]
+    n_cols = len(brand_grid[0]) if brand_grid else 0
+    col_edges = [int(i * w / n_cols) for i in range(n_cols + 1)]
+
+    for li, (y0, y1) in enumerate(levels):
+        for ci in range(n_cols):
+            x0, x1 = col_edges[ci], col_edges[ci + 1]
+            brand_id = brand_grid[li][ci]
+
+            cell = img_bgr[y0:y1, x0:x1]
+            # Convert cell to RGB for EasyOCR
+            cell_rgb = cv2.cvtColor(cell, cv2.COLOR_BGR2RGB)
+            results = reader.readtext(cell_rgb)
+
+            for (bbox, text, prob) in results:
+                if prob > 0.3 and len(text) > 2:
+                    brand_texts[brand_id].append(text.strip().capitalize())
+
+    final_names = {}
+    for bid, texts in brand_texts.items():
+        if texts:
+            # Most common word longer than 3 chars
+            filtered_texts = [t for t in texts if len(t) > 3]
+            if not filtered_texts:
+                filtered_texts = texts
+
+            most_common = Counter(filtered_texts).most_common(1)
+            if most_common:
+                final_names[bid] = most_common[0][0]
+            else:
+                final_names[bid] = f"Marca {bid + 1}"
+        else:
+            final_names[bid] = f"Marca {bid + 1}"
+
+    return final_names
+
+
+# ─────────────────────────────────────────────
+# 5. BRAND CLUSTERING ACROSS THE SHELF
 # ─────────────────────────────────────────────
 
 def cluster_brands(
@@ -101,6 +175,7 @@ def cluster_brands(
     n_cols: int,
     n_brands: int,
     colors_per_cell: int = 2,
+    ocr_reader=None,
 ) -> dict:
     """
     Divides the shelf into a grid (levels x columns), extracts dominant colors,
@@ -119,11 +194,13 @@ def cluster_brands(
             row_colors.append(dominant[0])
         cell_colors.append(row_colors)
 
-    all_colors = np.array([c for row in cell_colors for c in row], dtype=np.float32)
+    # Convert cell_colors (RGB) to LAB for global clustering
+    all_colors_rgb = np.array([c for row in cell_colors for c in row], dtype=np.uint8)
+    all_colors_lab = cv2.cvtColor(all_colors_rgb.reshape(-1, 1, 3), cv2.COLOR_RGB2LAB).reshape(-1, 3).astype(np.float32)
 
-    n_clusters = min(n_brands, len(all_colors))
+    n_clusters = min(n_brands, len(all_colors_lab))
     km = KMeans(n_clusters=n_clusters, n_init=10, random_state=42)
-    labels = km.fit_predict(all_colors)
+    labels = km.fit_predict(all_colors_lab)
 
     brand_grid = []
     idx = 0
@@ -136,10 +213,15 @@ def cluster_brands(
 
     brand_colors = {}
     for bid in range(n_clusters):
-        center_rgb = km.cluster_centers_[bid][::-1]
+        center_lab = km.cluster_centers_[bid]
+        center_rgb = cv2.cvtColor(center_lab.reshape(1, 1, 3).astype(np.uint8), cv2.COLOR_LAB2RGB).reshape(3)
         brand_colors[bid] = tuple(center_rgb.astype(int))
 
-    brand_names = {bid: f"Marca {bid + 1}" for bid in range(n_clusters)}
+    # Attempt to detect brand names via OCR
+    try:
+        brand_names = detect_brand_names(img_bgr, levels, brand_grid, n_clusters, reader=ocr_reader)
+    except Exception:
+        brand_names = {bid: f"Marca {bid + 1}" for bid in range(n_clusters)}
 
     return {
         "brand_grid": brand_grid,
@@ -152,7 +234,7 @@ def cluster_brands(
 
 
 # ─────────────────────────────────────────────
-# 5. SHARE OF SHELF CALCULATION
+# 6. SHARE OF SHELF CALCULATION
 # ─────────────────────────────────────────────
 
 def compute_share_of_shelf(brand_grid: list, brand_names: dict) -> dict:
@@ -196,7 +278,7 @@ def compute_share_of_shelf(brand_grid: list, brand_names: dict) -> dict:
 
 
 # ─────────────────────────────────────────────
-# 6. ANNOTATED PREVIEW IMAGE
+# 7. ANNOTATED PREVIEW IMAGE
 # ─────────────────────────────────────────────
 
 def build_annotated_image(
